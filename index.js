@@ -14,7 +14,7 @@ const GOOGLE_DOC_ID = "1QDR2OwIg5vKWy0mKthaOi0pJo46dY_4eMRhVEujhpUk";
 const LINKEDIN_CLIENT_ID = process.env.LINKEDIN_CLIENT_ID;
 const LINKEDIN_CLIENT_SECRET = process.env.LINKEDIN_CLIENT_SECRET;
 const LINKEDIN_REDIRECT_URI = process.env.LINKEDIN_REDIRECT_URI || "https://jarvis-slack-bot-production.up.railway.app/linkedin/callback";
-const LINKEDIN_SCOPES = "openid profile email w_member_social";
+const LINKEDIN_SCOPES = "w_member_social";
 
 // In-memory token store (also persisted to env-friendly log)
 let linkedinTokens = {
@@ -227,12 +227,14 @@ app.get("/linkedin/callback", async (req, res) => {
     // Get user profile to confirm identity
     let profileName = "Unknown";
     try {
-      const profileRes = await axios.get("https://api.linkedin.com/v2/userinfo", {
+      const profileRes = await axios.get("https://api.linkedin.com/v2/me", {
         headers: { Authorization: `Bearer ${access_token}` },
       });
-      profileName = profileRes.data.name || profileRes.data.email || "Unknown";
+      const firstName = profileRes.data.localizedFirstName || "";
+      const lastName = profileRes.data.localizedLastName || "";
+      profileName = `${firstName} ${lastName}`.trim() || "Unknown";
       linkedinTokens.profile_name = profileName;
-      linkedinTokens.profile_sub = profileRes.data.sub;
+      linkedinTokens.profile_sub = profileRes.data.id;
     } catch (profileErr) {
       console.warn("[LinkedIn] Could not fetch profile:", profileErr.message);
     }
