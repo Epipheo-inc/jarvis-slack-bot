@@ -1,0 +1,19 @@
+{
+  "name": "jarvis-slack-bot",
+  "version": "1.0.0",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "engines": { "node": ">=18.0.0" },
+  "keywords": ["slack", "bot", "epipheo", "jarvis"],
+  "author": "Epipheo",
+  "license": "MIT",
+  "description": "Epipheo Jarvis Slack Bot – approval workflow for #jarvis-marketing channel",
+  "dependencies": {
+    "axios": "^1.13.6",
+    "express": "^5.2.1",
+    "google-auth-library": "^10.6.1",
+    "googleapis": "^171.4.0"
+  }
+}
