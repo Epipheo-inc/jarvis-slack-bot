@@ -200,6 +200,7 @@ app.get("/health", (_req, res) => {
     bot: "Jarvis",
     uptime: process.uptime(),
     linkedin_connected: !!linkedinTokens.access_token,
+    google_ads_connected: !!googleAdsTokens.access_token,
   });
 });
 
@@ -216,6 +217,9 @@ app.get("/", (_req, res) => {
       linkedin_org_lookup: "GET /linkedin/org-lookup?vanityName=epipheo",
       linkedin_post_company: "POST /linkedin/post-company",
       linkedin_upload_image: "POST /linkedin/upload-image",
+      google_ads_auth: "GET /google-ads/auth",
+      google_ads_callback: "GET /google-ads/callback",
+      google_ads_tokens: "GET /google-ads/tokens (x-jarvis-key header required)",
       quickbooks_auth: "GET /quickbooks/auth",
       quickbooks_callback: "GET /quickbooks/callback",
       quickbooks_tokens: "GET /quickbooks/tokens (x-jarvis-key header required)",
@@ -691,6 +695,123 @@ app.post("/slack/events", async (req, res) => {
   }
 });
 
+// ─── Google Ads OAuth ─────────────────────────────────────────────────────
+
+const GOOGLE_ADS_CLIENT_ID = process.env.GOOGLE_ADS_CLIENT_ID;
+const GOOGLE_ADS_CLIENT_SECRET = process.env.GOOGLE_ADS_CLIENT_SECRET;
+const GOOGLE_ADS_REDIRECT_URI = "https://jarvis-slack-bot-production.up.railway.app/google-ads/callback";
+const GOOGLE_ADS_SCOPES = "https://www.googleapis.com/auth/adwords";
+const GOOGLE_ADS_DEVELOPER_TOKEN = process.env.GOOGLE_ADS_DEVELOPER_TOKEN;
+const GOOGLE_ADS_CUSTOMER_ID = process.env.GOOGLE_ADS_CUSTOMER_ID;
+const GOOGLE_ADS_MANAGER_ID = process.env.GOOGLE_ADS_MANAGER_ID;
+
+// In-memory Google Ads token store
+let googleAdsTokens = {
+  access_token: null,
+  refresh_token: null,
+  expires_at: null,
+  received_at: null,
+  token_type: null,
+};
+
+// Step 1: Redirect user to Google OAuth consent screen
+app.get("/google-ads/auth", (req, res) => {
+  const state = Math.random().toString(36).substring(2, 15);
+  const authUrl =
+    `https://accounts.google.com/o/oauth2/v2/auth` +
+    `?response_type=code` +
+    `&client_id=${encodeURIComponent(GOOGLE_ADS_CLIENT_ID)}` +
+    `&redirect_uri=${encodeURIComponent(GOOGLE_ADS_REDIRECT_URI)}` +
+    `&scope=${encodeURIComponent(GOOGLE_ADS_SCOPES)}` +
+    `&access_type=offline` +
+    `&prompt=consent` +
+    `&state=${state}`;
+  console.log("[Google Ads] Redirecting to authorization URL.");
+  res.redirect(authUrl);
+});
+
+// Step 2: Handle OAuth callback from Google
+app.get("/google-ads/callback", async (req, res) => {
+  const { code, state, error, error_description } = req.query;
+
+  if (error) {
+    console.error(`[Google Ads] OAuth error: ${error} — ${error_description}`);
+    return res.status(400).send(`<h1>Google Ads Authorization Failed</h1><p>${error}: ${error_description}</p>`);
+  }
+
+  if (!code) {
+    return res.status(400).send("<h1>Missing authorization code</h1>");
+  }
+
+  try {
+    const tokenResponse = await axios.post(
+      "https://oauth2.googleapis.com/token",
+      new URLSearchParams({
+        grant_type: "authorization_code",
+        code,
+        redirect_uri: GOOGLE_ADS_REDIRECT_URI,
+        client_id: GOOGLE_ADS_CLIENT_ID,
+        client_secret: GOOGLE_ADS_CLIENT_SECRET,
+      }).toString(),
+      {
+        headers: {
+          "Content-Type": "application/x-www-form-urlencoded",
+          Accept: "application/json",
+        },
+      }
+    );
+
+    const { access_token, refresh_token, expires_in, token_type } = tokenResponse.data;
+
+    googleAdsTokens = {
+      access_token,
+      refresh_token: refresh_token || null,
+      expires_at: Date.now() + (expires_in || 3600) * 1000,
+      received_at: new Date().toISOString(),
+      token_type: token_type || "Bearer",
+    };
+
+    console.log(`[Google Ads] Authorization successful. Token expires in ${expires_in}s.`);
+
+    res.send(`
+      <html>
+      <body style="font-family: -apple-system, BlinkMacSystemFont, sans-serif; max-width: 600px; margin: 80px auto; text-align: center;">
+        <h1 style="color: #4285F4;">&#x2705; Google Ads Connected!</h1>
+        <p>Authorization successful.</p>
+        <p>Access token received: &#x2705;</p>
+        ${refresh_token ? '<p>Refresh token: &#x2705; Received (auto-renewal enabled)</p>' : '<p>Refresh token: &#x274C; Not provided</p>'}
+        <p>Authorized at: <strong>${new Date().toLocaleString()}</strong></p>
+        <p>Developer Token: <strong>${GOOGLE_ADS_DEVELOPER_TOKEN ? '&#x2705; Configured' : '&#x274C; Not set'}</strong></p>
+        <p>Customer ID: <strong>${GOOGLE_ADS_CUSTOMER_ID || 'Not set'}</strong></p>
+        <p>Manager Account ID: <strong>${GOOGLE_ADS_MANAGER_ID || 'Not set'}</strong></p>
+        <hr>
+        <p style="color: #666;">You can close this window. Jarvis now has a valid Google Ads access token.</p>
+      </body>
+      </html>
+    `);
+  } catch (err) {
+    console.error("[Google Ads] Token exchange error:", err.response?.data || err.message);
+    res.status(500).send(`<h1>Token Exchange Failed</h1><pre>${JSON.stringify(err.response?.data || err.message, null, 2)}</pre>`);
+  }
+});
+
+// Retrieve Google Ads tokens (for Jarvis internal use)
+app.get("/google-ads/tokens", (req, res) => {
+  const authHeader = req.headers["x-jarvis-key"];
+  if (authHeader !== "jarvis-internal-2026") {
+    return res.status(403).json({ error: "Unauthorized" });
+  }
+  if (!googleAdsTokens.access_token) {
+    return res.status(404).json({ error: "No Google Ads tokens available. Visit /google-ads/auth first." });
+  }
+  res.json({
+    ...googleAdsTokens,
+    developer_token: GOOGLE_ADS_DEVELOPER_TOKEN,
+    customer_id: GOOGLE_ADS_CUSTOMER_ID,
+    manager_id: GOOGLE_ADS_MANAGER_ID,
+  });
+});
+
 // ─── QuickBooks Online OAuth ────────────────────────────────────────────────
 
 const QBO_CLIENT_ID = process.env.QBO_CLIENT_ID || "ABQ8sb9lLaLRhKqKqhZFQf8KK3lJT0vYztIUE9XqH0K193a0Ud";
@@ -906,4 +1027,7 @@ app.listen(PORT, () => {
   console.log(`   Salesforce auth: http://localhost:${PORT}/salesforce/auth`);
   console.log(`   Salesforce callback: http://localhost:${PORT}/salesforce/callback`);
   console.log(`   Salesforce tokens: GET http://localhost:${PORT}/salesforce/tokens`);
+  console.log(`   Google Ads auth: http://localhost:${PORT}/google-ads/auth`);
+  console.log(`   Google Ads callback: http://localhost:${PORT}/google-ads/callback`);
+  console.log(`   Google Ads tokens: GET http://localhost:${PORT}/google-ads/tokens`);
 });
