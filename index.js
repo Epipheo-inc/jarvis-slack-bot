@@ -16,8 +16,40 @@ const LINKEDIN_CLIENT_SECRET = process.env.LINKEDIN_CLIENT_SECRET;
 const LINKEDIN_REDIRECT_URI = process.env.LINKEDIN_REDIRECT_URI || "https://jarvis-slack-bot-production.up.railway.app/linkedin/callback";
 const LINKEDIN_SCOPES = "w_organization_social r_organization_social";
 
-// LinkedIn API version (YYYYMM format)
+// LinkedIn API version (YYYYMMDD format)
 const LINKEDIN_API_VERSION = "20241101";
+
+// Railway API for persisting tokens across restarts
+const RAILWAY_TOKEN = process.env.RAILWAY_TOKEN;
+const RAILWAY_PROJECT_ID = process.env.RAILWAY_PROJECT_ID || "c4b48619-a3c1-418e-8910-4aaacad8630e";
+const RAILWAY_ENV_ID = process.env.RAILWAY_ENV_ID || "2bd94efb-3d10-4182-ad30-f72d383029f7";
+const RAILWAY_SERVICE_ID = process.env.RAILWAY_SERVICE_ID || "8b4f2d6d-8e93-4173-916b-52a8b9585a59";
+
+async function persistTokenToRailway(tokens) {
+  if (!RAILWAY_TOKEN) {
+    console.warn("[Railway] RAILWAY_TOKEN not set — token will not persist across restarts.");
+    return;
+  }
+  try {
+    const vars = [
+      { name: "LINKEDIN_ACCESS_TOKEN", value: tokens.access_token || "" },
+      { name: "LINKEDIN_REFRESH_TOKEN", value: tokens.refresh_token || "" },
+      { name: "LINKEDIN_EXPIRES_AT", value: tokens.expires_at ? String(tokens.expires_at) : "" },
+    ];
+    for (const v of vars) {
+      await axios.post(
+        "https://backboard.railway.app/graphql/v2",
+        {
+          query: `mutation { variableUpsert(input: { projectId: "${RAILWAY_PROJECT_ID}", environmentId: "${RAILWAY_ENV_ID}", serviceId: "${RAILWAY_SERVICE_ID}", name: "${v.name}", value: "${v.value.replace(/"/g, '\\"')}" }) }`
+        },
+        { headers: { Authorization: RAILWAY_TOKEN, "Content-Type": "application/json" } }
+      );
+    }
+    console.log("[Railway] LinkedIn tokens persisted to environment variables.");
+  } catch (err) {
+    console.error("[Railway] Failed to persist tokens:", err.response?.data || err.message);
+  }
+}
 
 // In-memory token store (also persisted to env-friendly log)
 let linkedinTokens = {
@@ -278,6 +310,9 @@ app.get("/linkedin/callback", async (req, res) => {
         ? Date.now() + refresh_token_expires_in * 1000
         : null,
     };
+
+    // Persist token to Railway env vars so it survives restarts
+    persistTokenToRailway(linkedinTokens);
 
     console.log(`[LinkedIn] Authorization successful. Token expires in ${expires_in}s.`);
     if (refresh_token) {
