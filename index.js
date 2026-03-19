@@ -17,7 +17,7 @@ const LINKEDIN_REDIRECT_URI = process.env.LINKEDIN_REDIRECT_URI || "https://jarv
 const LINKEDIN_SCOPES = "w_organization_social r_organization_social";
 
 // LinkedIn API version (YYYYMM format)
-const LINKEDIN_API_VERSION = "202502";
+const LINKEDIN_API_VERSION = "20241101";
 
 // In-memory token store (also persisted to env-friendly log)
 let linkedinTokens = {
