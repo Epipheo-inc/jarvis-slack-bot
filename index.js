@@ -17,7 +17,7 @@ const LINKEDIN_REDIRECT_URI = process.env.LINKEDIN_REDIRECT_URI || "https://jarv
 const LINKEDIN_SCOPES = "w_organization_social r_organization_social";
 
 // LinkedIn API version (YYYYMM format — LinkedIn requires exactly 6 digits)
-const LINKEDIN_API_VERSION = "202411";
+const LINKEDIN_API_VERSION = process.env.LINKEDIN_API_VERSION || "202411";
 
 // Railway API for persisting tokens across restarts
 const RAILWAY_TOKEN = process.env.RAILWAY_TOKEN;
