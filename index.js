@@ -19,44 +19,53 @@ const LINKEDIN_SCOPES = "w_organization_social r_organization_social";
 // LinkedIn API version (YYYYMM format — LinkedIn requires exactly 6 digits)
 const LINKEDIN_API_VERSION = process.env.LINKEDIN_API_VERSION || "202411";
 
-// Railway API for persisting tokens across restarts
-const RAILWAY_TOKEN = process.env.RAILWAY_TOKEN;
-const RAILWAY_PROJECT_ID = process.env.RAILWAY_PROJECT_ID || "c4b48619-a3c1-418e-8910-4aaacad8630e";
-const RAILWAY_ENV_ID = process.env.RAILWAY_ENV_ID || "2bd94efb-3d10-4182-ad30-f72d383029f7";
-const RAILWAY_SERVICE_ID = process.env.RAILWAY_SERVICE_ID || "8b4f2d6d-8e93-4173-916b-52a8b9585a59";
+// File-based token persistence — stores tokens in a JSON file on Railway's persistent volume
+// This survives container restarts without requiring any Railway API permissions.
+const TOKEN_FILE_PATH = process.env.TOKEN_FILE_PATH || "/data/linkedin_tokens.json";
 
-async function persistTokenToRailway(tokens) {
-  if (!RAILWAY_TOKEN) {
-    console.warn("[Railway] RAILWAY_TOKEN not set — token will not persist across restarts.");
-    return;
-  }
+function persistTokenToFile(tokens) {
   try {
-    const vars = [
-      { name: "LINKEDIN_ACCESS_TOKEN", value: tokens.access_token || "" },
-      { name: "LINKEDIN_REFRESH_TOKEN", value: tokens.refresh_token || "" },
-      { name: "LINKEDIN_EXPIRES_AT", value: tokens.expires_at ? String(tokens.expires_at) : "" },
-    ];
-    for (const v of vars) {
-      await axios.post(
-        "https://backboard.railway.app/graphql/v2",
-        {
-          query: `mutation { variableUpsert(input: { projectId: "${RAILWAY_PROJECT_ID}", environmentId: "${RAILWAY_ENV_ID}", serviceId: "${RAILWAY_SERVICE_ID}", name: "${v.name}", value: "${v.value.replace(/"/g, '\\"')}" }) }`
-        },
-        { headers: { Authorization: RAILWAY_TOKEN, "Content-Type": "application/json" } }
-      );
+    const dir = path.dirname(TOKEN_FILE_PATH);
+    if (!fs.existsSync(dir)) {
+      fs.mkdirSync(dir, { recursive: true });
     }
-    console.log("[Railway] LinkedIn tokens persisted to environment variables.");
+    fs.writeFileSync(TOKEN_FILE_PATH, JSON.stringify(tokens, null, 2), "utf8");
+    console.log(`[Token] LinkedIn tokens persisted to ${TOKEN_FILE_PATH}`);
   } catch (err) {
-    console.error("[Railway] Failed to persist tokens:", err.response?.data || err.message);
+    console.error("[Token] Failed to persist tokens to file:", err.message);
   }
 }
 
-// In-memory token store (also persisted to env-friendly log)
+function loadTokenFromFile() {
+  try {
+    if (fs.existsSync(TOKEN_FILE_PATH)) {
+      const data = JSON.parse(fs.readFileSync(TOKEN_FILE_PATH, "utf8"));
+      console.log(`[Token] LinkedIn tokens loaded from ${TOKEN_FILE_PATH}`);
+      return data;
+    }
+  } catch (err) {
+    console.warn("[Token] Could not load tokens from file:", err.message);
+  }
+  return null;
+}
+
+// Alias for backward compatibility
+const persistTokenToRailway = (tokens) => persistTokenToFile(tokens);
+
+// In-memory token store — loaded from persistent file on startup, falls back to env vars
+const _savedTokens = loadTokenFromFile();
 let linkedinTokens = {
-  access_token: process.env.LINKEDIN_ACCESS_TOKEN || null,
-  refresh_token: process.env.LINKEDIN_REFRESH_TOKEN || null,
-  expires_at: process.env.LINKEDIN_EXPIRES_AT ? parseInt(process.env.LINKEDIN_EXPIRES_AT) : null,
+  access_token: (_savedTokens && _savedTokens.access_token) || process.env.LINKEDIN_ACCESS_TOKEN || null,
+  refresh_token: (_savedTokens && _savedTokens.refresh_token) || process.env.LINKEDIN_REFRESH_TOKEN || null,
+  expires_at: (_savedTokens && _savedTokens.expires_at) || (process.env.LINKEDIN_EXPIRES_AT ? parseInt(process.env.LINKEDIN_EXPIRES_AT) : null),
 };
+if (_savedTokens && _savedTokens.access_token) {
+  console.log("[Token] Restored LinkedIn token from persistent file. Expires:", new Date(linkedinTokens.expires_at).toISOString());
+} else if (process.env.LINKEDIN_ACCESS_TOKEN) {
+  console.log("[Token] Loaded LinkedIn token from environment variable.");
+} else {
+  console.warn("[Token] No LinkedIn token found. Visit /linkedin/auth to authorize.");
+}
 
 // Approval / hold keyword lists (lowercase)
 const APPROVAL_KEYWORDS = ["approved", "approve", "looks good", "lgtm", "go ahead", "ship it"];
