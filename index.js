@@ -587,13 +587,14 @@ app.post("/linkedin/upload-video", async (req, res) => {
     const videoResponse = await axios.get(videoUrl, { responseType: "arraybuffer" });
     const videoBuffer = Buffer.from(videoResponse.data);
 
-    // Step 3: Upload each chunk (usually single chunk for small videos)
+    // Step 3: Upload each chunk and collect ETags for finalization
+    const uploadedPartIds = [];
     for (const instruction of uploadInstructions) {
       const start = instruction.firstByte || 0;
-      const end = instruction.lastByte || videoBuffer.length;
+      const end = (instruction.lastByte !== undefined ? instruction.lastByte : videoBuffer.length - 1);
       const chunk = videoBuffer.slice(start, end + 1);
 
-      await axios.put(instruction.uploadUrl, chunk, {
+      const uploadRes = await axios.put(instruction.uploadUrl, chunk, {
         headers: {
           Authorization: `Bearer ${accessToken}`,
           "Content-Type": "application/octet-stream",
@@ -601,16 +602,19 @@ app.post("/linkedin/upload-video", async (req, res) => {
         maxContentLength: Infinity,
         maxBodyLength: Infinity,
       });
+      // Capture the ETag returned by LinkedIn for this chunk
+      const etag = (uploadRes.headers['etag'] || uploadRes.headers['ETag'] || '').replace(/"/g, '');
+      if (etag) uploadedPartIds.push(etag);
     }
 
-    // Step 4: Finalize the upload
+    // Step 4: Finalize the upload with collected ETags
     await axios.post(
       "https://api.linkedin.com/rest/videos?action=finalizeUpload",
       {
         finalizeUploadRequest: {
           video: videoUrn,
           uploadToken: "",
-          uploadedPartIds: [],
+          uploadedPartIds: uploadedPartIds,
         },
       },
       { headers: linkedinRestHeaders(accessToken) }
