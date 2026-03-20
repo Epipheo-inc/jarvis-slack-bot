@@ -1,199 +1,205 @@
 const express = require("express");
 const axios = require("axios");
-const { google } = require("googleapis");
-const fs = require("fs");
-const path = require("path");
 
 // ─── Configuration ───────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
 const SLACK_BOT_TOKEN = process.env.SLACK_BOT_TOKEN;
-const GOOGLE_SERVICE_ACCOUNT_JSON = process.env.GOOGLE_SERVICE_ACCOUNT_JSON; // JSON string
-const GOOGLE_DOC_ID = "1QDR2OwIg5vKWy0mKthaOi0pJo46dY_4eMRhVEujhpUk";
+const SLACK_TOKEN_CHANNEL = process.env.SLACK_TOKEN_CHANNEL || "C0AHKC2J5MK"; // #jarvis-marketing
 
 // LinkedIn OAuth config (Epipheo Page Manager app)
 const LINKEDIN_CLIENT_ID = process.env.LINKEDIN_CLIENT_ID;
 const LINKEDIN_CLIENT_SECRET = process.env.LINKEDIN_CLIENT_SECRET;
-const LINKEDIN_REDIRECT_URI = process.env.LINKEDIN_REDIRECT_URI || "https://jarvis-slack-bot-production.up.railway.app/linkedin/callback";
+const LINKEDIN_REDIRECT_URI =
+  process.env.LINKEDIN_REDIRECT_URI ||
+  "https://jarvis-slack-bot-production.up.railway.app/linkedin/callback";
 const LINKEDIN_SCOPES = "w_organization_social r_organization_social";
 
-// LinkedIn API version (YYYYMM format — LinkedIn requires exactly 6 digits)
-const LINKEDIN_API_VERSION = process.env.LINKEDIN_API_VERSION || "202411";
+// LinkedIn API version (YYYYMM format)
+const LINKEDIN_API_VERSION = process.env.LINKEDIN_API_VERSION || "202503";
+const LINKEDIN_ORG_ID = process.env.LINKEDIN_ORG_ID || "980418";
 
-// File-based token persistence — stores tokens in a JSON file on Railway's persistent volume
-// This survives container restarts without requiring any Railway API permissions.
-const TOKEN_FILE_PATH = process.env.TOKEN_FILE_PATH || "/data/linkedin_tokens.json";
-
-function persistTokenToFile(tokens) {
-  try {
-    const dir = path.dirname(TOKEN_FILE_PATH);
-    if (!fs.existsSync(dir)) {
-      fs.mkdirSync(dir, { recursive: true });
-    }
-    fs.writeFileSync(TOKEN_FILE_PATH, JSON.stringify(tokens, null, 2), "utf8");
-    console.log(`[Token] LinkedIn tokens persisted to ${TOKEN_FILE_PATH}`);
-  } catch (err) {
-    console.error("[Token] Failed to persist tokens to file:", err.message);
-  }
-}
-
-function loadTokenFromFile() {
-  try {
-    if (fs.existsSync(TOKEN_FILE_PATH)) {
-      const data = JSON.parse(fs.readFileSync(TOKEN_FILE_PATH, "utf8"));
-      console.log(`[Token] LinkedIn tokens loaded from ${TOKEN_FILE_PATH}`);
-      return data;
-    }
-  } catch (err) {
-    console.warn("[Token] Could not load tokens from file:", err.message);
-  }
-  return null;
-}
-
-// Alias for backward compatibility
-const persistTokenToRailway = (tokens) => persistTokenToFile(tokens);
-
-// In-memory token store — loaded from persistent file on startup, falls back to env vars
-const _savedTokens = loadTokenFromFile();
-let linkedinTokens = {
-  access_token: (_savedTokens && _savedTokens.access_token) || process.env.LINKEDIN_ACCESS_TOKEN || null,
-  refresh_token: (_savedTokens && _savedTokens.refresh_token) || process.env.LINKEDIN_REFRESH_TOKEN || null,
-  expires_at: (_savedTokens && _savedTokens.expires_at) || (process.env.LINKEDIN_EXPIRES_AT ? parseInt(process.env.LINKEDIN_EXPIRES_AT) : null),
-};
-if (_savedTokens && _savedTokens.access_token) {
-  console.log("[Token] Restored LinkedIn token from persistent file. Expires:", new Date(linkedinTokens.expires_at).toISOString());
-} else if (process.env.LINKEDIN_ACCESS_TOKEN) {
-  console.log("[Token] Loaded LinkedIn token from environment variable.");
-} else {
-  console.warn("[Token] No LinkedIn token found. Visit /linkedin/auth to authorize.");
-}
-
-// Approval / hold keyword lists (lowercase)
-const APPROVAL_KEYWORDS = ["approved", "approve", "looks good", "lgtm", "go ahead", "ship it"];
-const HOLD_KEYWORDS = ["hold", "skip", "wait", "pause", "not yet"];
+// Token marker used to find/replace the token message in Slack
+const TOKEN_MARKER = "JARVIS_LINKEDIN_TOKEN_V2";
 
 const SIGNATURE = "\n\n— Jarvis";
 
-// ─── Google Docs helper ──────────────────────────────────────────────────────
-let docsClient = null;
+// ─── Slack-based Token Persistence ──────────────────────────────────────────
+// Tokens are stored as a Slack message in #jarvis-marketing.
+// On startup, the server reads channel history to find the token.
+// On OAuth, the server deletes the old token message and posts a new one.
+// This survives all Railway restarts with zero manual intervention.
 
-function getDocsClient() {
-  if (docsClient) return docsClient;
-  if (!GOOGLE_SERVICE_ACCOUNT_JSON) {
-    console.warn("⚠️  GOOGLE_SERVICE_ACCOUNT_JSON not set – Google Doc updates disabled.");
-    return null;
-  }
+let linkedinTokens = {
+  access_token: process.env.LINKEDIN_ACCESS_TOKEN || null,
+  refresh_token: process.env.LINKEDIN_REFRESH_TOKEN || null,
+  expires_at: process.env.LINKEDIN_EXPIRES_AT
+    ? parseInt(process.env.LINKEDIN_EXPIRES_AT)
+    : null,
+};
+
+// Post to Slack helper
+async function slackPost(channel, text) {
   try {
-    const creds = JSON.parse(GOOGLE_SERVICE_ACCOUNT_JSON);
-    const auth = new google.auth.GoogleAuth({
-      credentials: creds,
-      scopes: ["https://www.googleapis.com/auth/documents"],
-    });
-    docsClient = google.docs({ version: "v1", auth });
-    return docsClient;
+    const res = await axios.post(
+      "https://slack.com/api/chat.postMessage",
+      { channel, text },
+      {
+        headers: {
+          Authorization: `Bearer ${SLACK_BOT_TOKEN}`,
+          "Content-Type": "application/json",
+        },
+      }
+    );
+    return res.data;
   } catch (err) {
-    console.error("Failed to initialize Google Docs client:", err.message);
+    console.error("[Slack] Post error:", err.message);
     return null;
   }
 }
 
-async function updateDocStatus(newStatus) {
-  const docs = getDocsClient();
-  if (!docs) {
-    console.log(`[Google Doc] Would set status to "${newStatus}" but Docs client is unavailable.`);
-    return;
-  }
-
+// Delete a Slack message
+async function slackDelete(channel, ts) {
   try {
-    // Read the document to find the status line
-    const doc = await docs.documents.get({ documentId: GOOGLE_DOC_ID });
-    const body = doc.data.body.content;
+    await axios.post(
+      "https://slack.com/api/chat.delete",
+      { channel, ts },
+      {
+        headers: {
+          Authorization: `Bearer ${SLACK_BOT_TOKEN}`,
+          "Content-Type": "application/json",
+        },
+      }
+    );
+  } catch (err) {
+    console.error("[Slack] Delete error:", err.message);
+  }
+}
 
-    let statusStart = null;
-    let statusEnd = null;
+// Read channel history and find token message
+async function findTokenInSlack() {
+  try {
+    let cursor;
+    let pages = 0;
+    // Search up to 5 pages (500 messages) to find the token
+    while (pages < 5) {
+      const params = new URLSearchParams({
+        channel: SLACK_TOKEN_CHANNEL,
+        limit: "100",
+      });
+      if (cursor) params.append("cursor", cursor);
 
-    // Walk through all structural elements looking for "Status:" text
-    for (const element of body) {
-      if (element.paragraph && element.paragraph.elements) {
-        for (const el of element.paragraph.elements) {
-          if (el.textRun && el.textRun.content) {
-            const text = el.textRun.content;
-            const idx = text.toLowerCase().indexOf("status:");
-            if (idx !== -1) {
-              // Found the status line – replace from "Status:" to end of that text run
-              statusStart = el.startIndex + idx;
-              statusEnd = el.endIndex;
-              break;
-            }
+      const res = await axios.get(
+        `https://slack.com/api/conversations.history?${params}`,
+        {
+          headers: { Authorization: `Bearer ${SLACK_BOT_TOKEN}` },
+        }
+      );
+
+      if (!res.data.ok) {
+        console.error("[Token] Slack history error:", res.data.error);
+        return null;
+      }
+
+      for (const msg of res.data.messages || []) {
+        const text = msg.text || "";
+        if (text.includes(TOKEN_MARKER)) {
+          // Extract JSON payload after the marker
+          const idx = text.indexOf(TOKEN_MARKER);
+          const jsonStr = text.substring(idx + TOKEN_MARKER.length + 1).trim();
+          try {
+            const tokens = JSON.parse(jsonStr);
+            return { tokens, ts: msg.ts };
+          } catch (parseErr) {
+            console.warn("[Token] Found marker but failed to parse JSON:", parseErr.message);
           }
         }
       }
-      if (statusStart !== null) break;
-    }
 
-    if (statusStart !== null && statusEnd !== null) {
-      // Replace the existing status line
-      const replacement = `Status: ${newStatus}\n`;
-      await docs.documents.batchUpdate({
-        documentId: GOOGLE_DOC_ID,
-        requestBody: {
-          requests: [
-            { deleteContentRange: { range: { startIndex: statusStart, endIndex: statusEnd } } },
-            { insertText: { location: { index: statusStart }, text: replacement } },
-          ],
-        },
-      });
-      console.log(`[Google Doc] Status updated to "${newStatus}".`);
-    } else {
-      // No status line found – append one at the end of the document
-      const endIndex = doc.data.body.content[doc.data.body.content.length - 1].endIndex - 1;
-      await docs.documents.batchUpdate({
-        documentId: GOOGLE_DOC_ID,
-        requestBody: {
-          requests: [
-            { insertText: { location: { index: endIndex }, text: `\nStatus: ${newStatus}\n` } },
-          ],
-        },
-      });
-      console.log(`[Google Doc] Appended status "${newStatus}" (no existing status line found).`);
+      cursor = res.data.response_metadata?.next_cursor;
+      if (!cursor) break;
+      pages++;
     }
+    return null;
   } catch (err) {
-    console.error("[Google Doc] Error updating status:", err.message);
+    console.error("[Token] Error searching Slack for token:", err.message);
+    return null;
   }
 }
 
-// ─── Slack helper ────────────────────────────────────────────────────────────
-async function postSlackMessage(channel, text) {
+// Save token to Slack (delete old, post new)
+async function saveTokenToSlack(tokens) {
   try {
-    await axios.post(
-      "https://slack.com/api/chat.postMessage",
-      { channel, text: text + SIGNATURE },
-      { headers: { Authorization: `Bearer ${SLACK_BOT_TOKEN}`, "Content-Type": "application/json" } }
+    // First, find and delete any existing token message
+    const existing = await findTokenInSlack();
+    if (existing && existing.ts) {
+      console.log("[Token] Deleting old token message from Slack...");
+      await slackDelete(SLACK_TOKEN_CHANNEL, existing.ts);
+    }
+
+    // Post new token message (not visible as a normal message — it's a system record)
+    const payload = JSON.stringify({
+      access_token: tokens.access_token,
+      refresh_token: tokens.refresh_token || null,
+      expires_at: tokens.expires_at || null,
+      saved_at: new Date().toISOString(),
+    });
+
+    const result = await slackPost(
+      SLACK_TOKEN_CHANNEL,
+      `🔐 ${TOKEN_MARKER} ${payload}`
     );
+
+    if (result && result.ok) {
+      console.log("[Token] LinkedIn token saved to Slack successfully.");
+    } else {
+      console.error("[Token] Failed to save token to Slack:", result);
+    }
   } catch (err) {
-    console.error("[Slack] Error posting message:", err.message);
+    console.error("[Token] Error saving token to Slack:", err.message);
   }
 }
 
-// ─── Classify message ────────────────────────────────────────────────────────
-function classifyMessage(text) {
-  const lower = text.toLowerCase();
-  for (const kw of APPROVAL_KEYWORDS) {
-    if (lower.includes(kw)) return "approved";
+// Load token from Slack on startup
+async function loadTokenFromSlack() {
+  if (!SLACK_BOT_TOKEN) {
+    console.warn("[Token] No SLACK_BOT_TOKEN — cannot load token from Slack.");
+    return;
   }
-  for (const kw of HOLD_KEYWORDS) {
-    if (lower.includes(kw)) return "hold";
+
+  console.log("[Token] Searching Slack for persisted LinkedIn token...");
+  const found = await findTokenInSlack();
+
+  if (found && found.tokens && found.tokens.access_token) {
+    linkedinTokens.access_token = found.tokens.access_token;
+    linkedinTokens.refresh_token = found.tokens.refresh_token || linkedinTokens.refresh_token;
+    linkedinTokens.expires_at = found.tokens.expires_at || linkedinTokens.expires_at;
+
+    const expiresDate = linkedinTokens.expires_at
+      ? new Date(linkedinTokens.expires_at).toISOString()
+      : "unknown";
+    const isExpired = linkedinTokens.expires_at && Date.now() > linkedinTokens.expires_at;
+
+    console.log(`[Token] ✅ LinkedIn token restored from Slack. Expires: ${expiresDate}${isExpired ? " (EXPIRED)" : ""}`);
+  } else if (linkedinTokens.access_token) {
+    console.log("[Token] No token in Slack, but found one in env vars.");
+  } else {
+    console.warn("[Token] ⚠️ No LinkedIn token found. Visit /linkedin/auth to authorize.");
   }
-  return "feedback";
 }
 
-// ─── LinkedIn helper: get valid access token (auto-refresh) ─────────────────
+// ─── LinkedIn helpers ───────────────────────────────────────────────────────
+
 async function getLinkedInAccessToken() {
   if (!linkedinTokens.access_token) {
     throw new Error("Not authorized. Visit /linkedin/auth first.");
   }
 
   // Auto-refresh if expired and we have a refresh token
-  if (linkedinTokens.expires_at && Date.now() > linkedinTokens.expires_at && linkedinTokens.refresh_token) {
+  if (
+    linkedinTokens.expires_at &&
+    Date.now() > linkedinTokens.expires_at &&
+    linkedinTokens.refresh_token
+  ) {
     try {
       const refreshRes = await axios.post(
         "https://www.linkedin.com/oauth/v2/accessToken",
@@ -211,8 +217,13 @@ async function getLinkedInAccessToken() {
         linkedinTokens.refresh_token = refreshRes.data.refresh_token;
       }
       console.log("[LinkedIn] Token refreshed successfully.");
+      // Persist refreshed token to Slack
+      await saveTokenToSlack(linkedinTokens);
     } catch (refreshErr) {
-      console.error("[LinkedIn] Token refresh failed:", refreshErr.response?.data || refreshErr.message);
+      console.error(
+        "[LinkedIn] Token refresh failed:",
+        refreshErr.response?.data || refreshErr.message
+      );
       throw new Error("Token expired and refresh failed. Re-authorize at /linkedin/auth.");
     }
   }
@@ -220,7 +231,6 @@ async function getLinkedInAccessToken() {
   return linkedinTokens.access_token;
 }
 
-// ─── LinkedIn helper: standard headers for REST API ─────────────────────────
 function linkedinRestHeaders(accessToken) {
   return {
     Authorization: `Bearer ${accessToken}`,
@@ -230,7 +240,22 @@ function linkedinRestHeaders(accessToken) {
   };
 }
 
-// ─── Express app ─────────────────────────────────────────────────────────────
+// ─── Classify message (for Slack approval workflow) ─────────────────────────
+const APPROVAL_KEYWORDS = ["approved", "approve", "looks good", "lgtm", "go ahead", "ship it"];
+const HOLD_KEYWORDS = ["hold", "skip", "wait", "pause", "not yet"];
+
+function classifyMessage(text) {
+  const lower = text.toLowerCase();
+  for (const kw of APPROVAL_KEYWORDS) {
+    if (lower.includes(kw)) return "approved";
+  }
+  for (const kw of HOLD_KEYWORDS) {
+    if (lower.includes(kw)) return "hold";
+  }
+  return "feedback";
+}
+
+// ─── Express app ────────────────────────────────────────────────────────────
 const app = express();
 app.use(express.json({ limit: "50mb" }));
 
@@ -241,7 +266,10 @@ app.get("/health", (_req, res) => {
     bot: "Jarvis",
     uptime: process.uptime(),
     linkedin_connected: !!linkedinTokens.access_token,
-    google_ads_connected: !!googleAdsTokens.access_token,
+    linkedin_expires: linkedinTokens.expires_at
+      ? new Date(linkedinTokens.expires_at).toISOString()
+      : null,
+    token_storage: "slack",
   });
 });
 
@@ -249,25 +277,25 @@ app.get("/health", (_req, res) => {
 app.get("/", (_req, res) => {
   res.json({
     message: "Jarvis Slack Bot is running.",
+    version: "2.0.0",
+    token_persistence: "Slack channel message",
     endpoints: {
-      slack_events: "POST /slack/events",
+      health: "GET /health",
       linkedin_auth: "GET /linkedin/auth",
       linkedin_callback: "GET /linkedin/callback",
       linkedin_status: "GET /linkedin/status",
-      linkedin_post: "POST /linkedin/post",
-      linkedin_org_lookup: "GET /linkedin/org-lookup?vanityName=epipheo",
+      linkedin_token: "GET /linkedin/token (x-jarvis-key required)",
       linkedin_post_company: "POST /linkedin/post-company",
       linkedin_upload_image: "POST /linkedin/upload-image",
+      linkedin_upload_video: "POST /linkedin/upload-video",
+      linkedin_org_lookup: "GET /linkedin/org-lookup?vanityName=epipheo",
+      slack_events: "POST /slack/events",
       google_ads_auth: "GET /google-ads/auth",
       google_ads_callback: "GET /google-ads/callback",
-      google_ads_tokens: "GET /google-ads/tokens (x-jarvis-key header required)",
       quickbooks_auth: "GET /quickbooks/auth",
       quickbooks_callback: "GET /quickbooks/callback",
-      quickbooks_tokens: "GET /quickbooks/tokens (x-jarvis-key header required)",
       salesforce_auth: "GET /salesforce/auth",
       salesforce_callback: "GET /salesforce/callback",
-      salesforce_tokens: "GET /salesforce/tokens (x-jarvis-key header required)",
-      health: "GET /health",
     },
   });
 });
@@ -282,13 +310,15 @@ app.get("/linkedin/auth", (_req, res) => {
   res.redirect(authUrl);
 });
 
-// Step 2: Handle OAuth callback
+// Step 2: Handle OAuth callback — exchange code for token and persist to Slack
 app.get("/linkedin/callback", async (req, res) => {
   const { code, error, error_description } = req.query;
 
   if (error) {
     console.error(`[LinkedIn] OAuth error: ${error} — ${error_description}`);
-    return res.status(400).send(`<h1>LinkedIn Authorization Failed</h1><p>${error}: ${error_description}</p>`);
+    return res.status(400).send(
+      `<h1>LinkedIn Authorization Failed</h1><p>${error}: ${error_description}</p>`
+    );
   }
 
   if (!code) {
@@ -309,62 +339,57 @@ app.get("/linkedin/callback", async (req, res) => {
       { headers: { "Content-Type": "application/x-www-form-urlencoded" } }
     );
 
-    const { access_token, expires_in, refresh_token, refresh_token_expires_in } = tokenResponse.data;
+    const { access_token, expires_in, refresh_token, refresh_token_expires_in } =
+      tokenResponse.data;
 
     linkedinTokens = {
       access_token,
       refresh_token: refresh_token || null,
       expires_at: Date.now() + expires_in * 1000,
-      refresh_token_expires_at: refresh_token_expires_in
-        ? Date.now() + refresh_token_expires_in * 1000
-        : null,
     };
 
-    // Persist token to Railway env vars so it survives restarts
-    persistTokenToRailway(linkedinTokens);
+    // ═══ PERSIST TOKEN TO SLACK ═══
+    await saveTokenToSlack(linkedinTokens);
 
     console.log(`[LinkedIn] Authorization successful. Token expires in ${expires_in}s.`);
-    if (refresh_token) {
-      console.log(`[LinkedIn] Refresh token received. Expires in ${refresh_token_expires_in}s.`);
-    }
 
-    // Try to get organization admin info to confirm access
+    // Try to verify org access
     let orgInfo = "Organization access granted";
     try {
       const orgRes = await axios.get(
-        "https://api.linkedin.com/rest/organizationAcls?q=roleAssignee&role=ADMINISTRATOR&projection=(elements*(organization~(localizedName,vanityName)))",
+        "https://api.linkedin.com/rest/organizationAcls?q=roleAssignee&role=ADMINISTRATOR",
         { headers: linkedinRestHeaders(access_token) }
       );
-      const orgs = orgRes.data.elements || [];
-      if (orgs.length > 0) {
-        const orgNames = orgs.map(o => {
-          const org = o["organization~"];
-          return org ? `${org.localizedName} (${org.vanityName})` : "Unknown org";
-        });
-        orgInfo = `Admin of: ${orgNames.join(", ")}`;
-        linkedinTokens.organizations = orgs;
+      const elements = orgRes.data.elements || [];
+      if (elements.length > 0) {
+        orgInfo = `Admin of ${elements.length} organization(s)`;
       }
     } catch (orgErr) {
-      console.warn("[LinkedIn] Could not fetch org info:", orgErr.response?.data || orgErr.message);
-      orgInfo = "Could not verify organization access (this is OK — token is still valid)";
+      orgInfo = "Could not verify org access (token is still valid)";
     }
+
+    const expiresDate = new Date(linkedinTokens.expires_at).toLocaleString();
 
     res.send(`
       <html>
       <body style="font-family: -apple-system, BlinkMacSystemFont, sans-serif; max-width: 600px; margin: 80px auto; text-align: center;">
         <h1 style="color: #0A66C2;">✅ LinkedIn Connected!</h1>
-        <p><strong>Epipheo Page Manager</strong> app authorized.</p>
+        <p><strong>Epipheo Page Manager</strong> authorized.</p>
         <p>${orgInfo}</p>
-        <p>Access token expires: <strong>${new Date(linkedinTokens.expires_at).toLocaleString()}</strong></p>
-        ${refresh_token ? '<p>Refresh token: ✅ Received (auto-renewal enabled)</p>' : '<p>Refresh token: ❌ Not provided (will need to re-authorize when token expires)</p>'}
+        <p>Token expires: <strong>${expiresDate}</strong></p>
+        <p>Token persisted to: <strong>Slack #jarvis-marketing</strong></p>
+        ${refresh_token ? "<p>Refresh token: ✅ Auto-renewal enabled</p>" : "<p>Refresh token: ❌ Will need re-auth when token expires</p>"}
         <hr>
-        <p style="color: #666;">You can close this window. Jarvis can now post to the Epipheo LinkedIn company page.</p>
+        <p style="color: #28a745; font-weight: bold;">✅ Token will survive all server restarts. No manual steps needed.</p>
+        <p style="color: #666;">You can close this window.</p>
       </body>
       </html>
     `);
   } catch (err) {
     console.error("[LinkedIn] Token exchange error:", err.response?.data || err.message);
-    res.status(500).send(`<h1>Token Exchange Failed</h1><pre>${JSON.stringify(err.response?.data || err.message, null, 2)}</pre>`);
+    res.status(500).send(
+      `<h1>Token Exchange Failed</h1><pre>${JSON.stringify(err.response?.data || err.message, null, 2)}</pre>`
+    );
   }
 });
 
@@ -377,7 +402,11 @@ app.get("/linkedin/token", (req, res) => {
   if (!linkedinTokens.access_token) {
     return res.status(404).json({ error: "No token available. Visit /linkedin/auth first." });
   }
-  res.json({ access_token: linkedinTokens.access_token });
+  res.json({
+    access_token: linkedinTokens.access_token,
+    expires_at: linkedinTokens.expires_at,
+    has_refresh_token: !!linkedinTokens.refresh_token,
+  });
 });
 
 // Status check
@@ -389,29 +418,34 @@ app.get("/linkedin/status", async (_req, res) => {
     });
   }
 
-  const expired = linkedinTokens.expires_at && Date.now() > linkedinTokens.expires_at;
+  const expired =
+    linkedinTokens.expires_at && Date.now() > linkedinTokens.expires_at;
   res.json({
     connected: true,
     expired,
-    expires_at: linkedinTokens.expires_at ? new Date(linkedinTokens.expires_at).toISOString() : null,
+    expires_at: linkedinTokens.expires_at
+      ? new Date(linkedinTokens.expires_at).toISOString()
+      : null,
     has_refresh_token: !!linkedinTokens.refresh_token,
     scopes: LINKEDIN_SCOPES,
     api_version: LINKEDIN_API_VERSION,
+    org_id: LINKEDIN_ORG_ID,
+    token_storage: "slack",
   });
 });
 
 // ─── Organization Lookup ────────────────────────────────────────────────────
-// GET /linkedin/org-lookup?vanityName=epipheo
 app.get("/linkedin/org-lookup", async (req, res) => {
   try {
     const accessToken = await getLinkedInAccessToken();
     const { vanityName } = req.query;
 
     if (!vanityName) {
-      return res.status(400).json({ error: "Missing 'vanityName' query parameter. Example: /linkedin/org-lookup?vanityName=epipheo" });
+      return res.status(400).json({
+        error: "Missing 'vanityName' query parameter.",
+      });
     }
 
-    // Look up organization by vanity name
     const orgRes = await axios.get(
       `https://api.linkedin.com/rest/organizations?q=vanityName&vanityName=${encodeURIComponent(vanityName)}`,
       { headers: linkedinRestHeaders(accessToken) }
@@ -419,7 +453,9 @@ app.get("/linkedin/org-lookup", async (req, res) => {
 
     const elements = orgRes.data.elements || [];
     if (elements.length === 0) {
-      return res.status(404).json({ error: `No organization found with vanityName "${vanityName}".` });
+      return res.status(404).json({
+        error: `No organization found with vanityName "${vanityName}".`,
+      });
     }
 
     const org = elements[0];
@@ -430,58 +466,57 @@ app.get("/linkedin/org-lookup", async (req, res) => {
         urn: `urn:li:organization:${org.id}`,
         name: org.localizedName,
         vanityName: org.vanityName,
-        description: org.localizedDescription || null,
-        logoUrl: org.logoV2 ? org.logoV2["original~"]?.elements?.[0]?.identifiers?.[0]?.identifier : null,
       },
     });
   } catch (err) {
     console.error("[LinkedIn] Org lookup error:", err.response?.data || err.message);
-    res.status(err.response?.status || 500).json({ error: err.response?.data || err.message });
+    res.status(err.response?.status || 500).json({
+      error: err.response?.data || err.message,
+    });
   }
 });
 
 // ─── List Administered Organizations ────────────────────────────────────────
-// GET /linkedin/org-admin-list
 app.get("/linkedin/org-admin-list", async (_req, res) => {
   try {
     const accessToken = await getLinkedInAccessToken();
-
     const orgRes = await axios.get(
       "https://api.linkedin.com/rest/organizationAcls?q=roleAssignee&role=ADMINISTRATOR",
       { headers: linkedinRestHeaders(accessToken) }
     );
-
     const elements = orgRes.data.elements || [];
-    const organizations = elements.map(e => ({
-      organizationUrn: e.organization,
-      role: e.role,
-      state: e.state,
-    }));
-
-    res.json({ success: true, count: organizations.length, organizations });
+    res.json({
+      success: true,
+      count: elements.length,
+      organizations: elements.map((e) => ({
+        organizationUrn: e.organization,
+        role: e.role,
+        state: e.state,
+      })),
+    });
   } catch (err) {
     console.error("[LinkedIn] Org admin list error:", err.response?.data || err.message);
-    res.status(err.response?.status || 500).json({ error: err.response?.data || err.message });
+    res.status(err.response?.status || 500).json({
+      error: err.response?.data || err.message,
+    });
   }
 });
 
-// ─── Post to LinkedIn Company Page (REST API) ──────────────────────────────
-// POST /linkedin/post-company
-// Body: { "orgId": "12345", "text": "Post text", "imageUrn": "(optional)", "videoUrn": "(optional)" }
+// ─── Post to LinkedIn Company Page ──────────────────────────────────────────
 app.post("/linkedin/post-company", async (req, res) => {
   try {
     const accessToken = await getLinkedInAccessToken();
     const { orgId, text, imageUrn, videoUrn } = req.body;
+    const org = orgId || LINKEDIN_ORG_ID;
 
-    if (!orgId) {
-      return res.status(400).json({ error: "Missing 'orgId' in request body. Use /linkedin/org-lookup to find it." });
-    }
     if (!text && !imageUrn && !videoUrn) {
-      return res.status(400).json({ error: "Must provide at least 'text', 'imageUrn', or 'videoUrn'." });
+      return res.status(400).json({
+        error: "Must provide at least 'text', 'imageUrn', or 'videoUrn'.",
+      });
     }
 
     const postBody = {
-      author: `urn:li:organization:${orgId}`,
+      author: `urn:li:organization:${org}`,
       commentary: text || "",
       visibility: "PUBLIC",
       distribution: {
@@ -493,71 +528,51 @@ app.post("/linkedin/post-company", async (req, res) => {
       isReshareDisabledByAuthor: false,
     };
 
-    // Add image content if provided
     if (imageUrn) {
-      postBody.content = {
-        media: {
-          title: "Image",
-          id: imageUrn,
-        },
-      };
+      postBody.content = { media: { title: "Image", id: imageUrn } };
     }
-
-    // Add video content if provided
     if (videoUrn) {
-      postBody.content = {
-        media: {
-          title: "Video",
-          id: videoUrn,
-        },
-      };
+      postBody.content = { media: { title: "Video", id: videoUrn } };
     }
 
-    const postRes = await axios.post("https://api.linkedin.com/rest/posts", postBody, {
-      headers: linkedinRestHeaders(accessToken),
-    });
+    const postRes = await axios.post(
+      "https://api.linkedin.com/rest/posts",
+      postBody,
+      { headers: linkedinRestHeaders(accessToken) }
+    );
 
-    // The REST API returns 201 with x-restli-id header for the post URN
     const postUrn = postRes.headers["x-restli-id"] || postRes.data?.id || "created";
-    console.log(`[LinkedIn] Company page post published. URN: ${postUrn}`);
+    console.log(`[LinkedIn] Company post published. URN: ${postUrn}`);
     res.json({ success: true, post_urn: postUrn });
   } catch (err) {
     console.error("[LinkedIn] Company post error:", err.response?.data || err.message);
-    res.status(err.response?.status || 500).json({ error: err.response?.data || err.message });
+    res.status(err.response?.status || 500).json({
+      error: err.response?.data || err.message,
+    });
   }
 });
 
-// ─── Upload Image to LinkedIn (for company page posts) ─────────────────────
-// POST /linkedin/upload-image
-// Body: { "orgId": "12345", "imageUrl": "https://example.com/image.jpg" }
+// ─── Upload Image to LinkedIn ───────────────────────────────────────────────
 app.post("/linkedin/upload-image", async (req, res) => {
   try {
     const accessToken = await getLinkedInAccessToken();
     const { orgId, imageUrl } = req.body;
+    const org = orgId || LINKEDIN_ORG_ID;
 
-    if (!orgId || !imageUrl) {
-      return res.status(400).json({ error: "Missing 'orgId' or 'imageUrl' in request body." });
+    if (!imageUrl) {
+      return res.status(400).json({ error: "Missing 'imageUrl' in request body." });
     }
 
-    // Step 1: Initialize the image upload
     const initRes = await axios.post(
       "https://api.linkedin.com/rest/images?action=initializeUpload",
-      {
-        initializeUploadRequest: {
-          owner: `urn:li:organization:${orgId}`,
-        },
-      },
+      { initializeUploadRequest: { owner: `urn:li:organization:${org}` } },
       { headers: linkedinRestHeaders(accessToken) }
     );
 
     const { uploadUrl, image: imageUrn } = initRes.data.value;
-    console.log(`[LinkedIn] Image upload initialized. URN: ${imageUrn}`);
-
-    // Step 2: Download the image from the provided URL
     const imageResponse = await axios.get(imageUrl, { responseType: "arraybuffer" });
     const imageBuffer = Buffer.from(imageResponse.data);
 
-    // Step 3: Upload the image binary to LinkedIn's upload URL
     await axios.put(uploadUrl, imageBuffer, {
       headers: {
         Authorization: `Bearer ${accessToken}`,
@@ -567,32 +582,33 @@ app.post("/linkedin/upload-image", async (req, res) => {
       maxBodyLength: Infinity,
     });
 
-    console.log(`[LinkedIn] Image uploaded successfully. URN: ${imageUrn}`);
+    console.log(`[LinkedIn] Image uploaded. URN: ${imageUrn}`);
     res.json({ success: true, imageUrn });
   } catch (err) {
     console.error("[LinkedIn] Image upload error:", err.response?.data || err.message);
-    res.status(err.response?.status || 500).json({ error: err.response?.data || err.message });
+    res.status(err.response?.status || 500).json({
+      error: err.response?.data || err.message,
+    });
   }
 });
 
-// ─── Upload Video to LinkedIn (for company page posts) ─────────────────────
-// POST /linkedin/upload-video
-// Body: { "orgId": "12345", "videoUrl": "https://example.com/video.mp4", "fileSizeBytes": 12345678 }
+// ─── Upload Video to LinkedIn ───────────────────────────────────────────────
 app.post("/linkedin/upload-video", async (req, res) => {
   try {
     const accessToken = await getLinkedInAccessToken();
     const { orgId, videoUrl, fileSizeBytes } = req.body;
+    const org = orgId || LINKEDIN_ORG_ID;
 
-    if (!orgId || !videoUrl) {
-      return res.status(400).json({ error: "Missing 'orgId' or 'videoUrl' in request body." });
+    if (!videoUrl) {
+      return res.status(400).json({ error: "Missing 'videoUrl' in request body." });
     }
 
-    // Step 1: Initialize the video upload
+    // Step 1: Initialize video upload
     const initRes = await axios.post(
       "https://api.linkedin.com/rest/videos?action=initializeUpload",
       {
         initializeUploadRequest: {
-          owner: `urn:li:organization:${orgId}`,
+          owner: `urn:li:organization:${org}`,
           fileSizeBytes: fileSizeBytes || 0,
           uploadCaptions: false,
           uploadThumbnail: false,
@@ -604,15 +620,18 @@ app.post("/linkedin/upload-video", async (req, res) => {
     const { uploadInstructions, video: videoUrn } = initRes.data.value;
     console.log(`[LinkedIn] Video upload initialized. URN: ${videoUrn}`);
 
-    // Step 2: Download the video from the provided URL
+    // Step 2: Download video
     const videoResponse = await axios.get(videoUrl, { responseType: "arraybuffer" });
     const videoBuffer = Buffer.from(videoResponse.data);
 
-    // Step 3: Upload each chunk and collect ETags for finalization
+    // Step 3: Upload chunks
     const uploadedPartIds = [];
     for (const instruction of uploadInstructions) {
       const start = instruction.firstByte || 0;
-      const end = (instruction.lastByte !== undefined ? instruction.lastByte : videoBuffer.length - 1);
+      const end =
+        instruction.lastByte !== undefined
+          ? instruction.lastByte
+          : videoBuffer.length - 1;
       const chunk = videoBuffer.slice(start, end + 1);
 
       const uploadRes = await axios.put(instruction.uploadUrl, chunk, {
@@ -623,19 +642,21 @@ app.post("/linkedin/upload-video", async (req, res) => {
         maxContentLength: Infinity,
         maxBodyLength: Infinity,
       });
-      // Capture the ETag returned by LinkedIn for this chunk
-      const etag = (uploadRes.headers['etag'] || uploadRes.headers['ETag'] || '').replace(/"/g, '');
+      const etag = (uploadRes.headers["etag"] || uploadRes.headers["ETag"] || "").replace(
+        /"/g,
+        ""
+      );
       if (etag) uploadedPartIds.push(etag);
     }
 
-    // Step 4: Finalize the upload with collected ETags
+    // Step 4: Finalize upload
     await axios.post(
       "https://api.linkedin.com/rest/videos?action=finalizeUpload",
       {
         finalizeUploadRequest: {
           video: videoUrn,
           uploadToken: "",
-          uploadedPartIds: uploadedPartIds,
+          uploadedPartIds,
         },
       },
       { headers: linkedinRestHeaders(accessToken) }
@@ -645,60 +666,13 @@ app.post("/linkedin/upload-video", async (req, res) => {
     res.json({ success: true, videoUrn });
   } catch (err) {
     console.error("[LinkedIn] Video upload error:", err.response?.data || err.message);
-    res.status(err.response?.status || 500).json({ error: err.response?.data || err.message });
-  }
-});
-
-// ─── Legacy: Post to LinkedIn (personal profile via UGC API) ────────────────
-// Kept for backward compatibility
-app.post("/linkedin/post", async (req, res) => {
-  try {
-    const accessToken = await getLinkedInAccessToken();
-    const { text, author } = req.body;
-    const authorUrn = author || `urn:li:person:${linkedinTokens.profile_sub}`;
-
-    if (!text) {
-      return res.status(400).json({ error: "Missing 'text' in request body." });
-    }
-
-    // Use the new REST API for posting
-    const postBody = {
-      author: authorUrn,
-      commentary: text,
-      visibility: "PUBLIC",
-      distribution: {
-        feedDistribution: "MAIN_FEED",
-        targetEntities: [],
-        thirdPartyDistributionChannels: [],
-      },
-      lifecycleState: "PUBLISHED",
-      isReshareDisabledByAuthor: false,
-    };
-
-    const postRes = await axios.post("https://api.linkedin.com/rest/posts", postBody, {
-      headers: linkedinRestHeaders(accessToken),
+    res.status(err.response?.status || 500).json({
+      error: err.response?.data || err.message,
     });
-
-    const postUrn = postRes.headers["x-restli-id"] || postRes.data?.id || "created";
-    console.log(`[LinkedIn] Post published successfully. URN: ${postUrn}`);
-    res.json({ success: true, post_urn: postUrn });
-  } catch (err) {
-    console.error("[LinkedIn] Post error:", err.response?.data || err.message);
-    res.status(err.response?.status || 500).json({ error: err.response?.data || err.message });
   }
 });
 
-// Get LinkedIn tokens (for Jarvis to retrieve)
-app.get("/linkedin/tokens", (req, res) => {
-  // Simple auth check — only allow from known sources
-  const authHeader = req.headers["x-jarvis-key"];
-  if (authHeader !== "jarvis-internal-2026") {
-    return res.status(403).json({ error: "Unauthorized" });
-  }
-  res.json(linkedinTokens);
-});
-
-// Deduplicate events (Slack may retry)
+// ─── Slack Events (Approval Workflow) ───────────────────────────────────────
 const processedEvents = new Set();
 const MAX_PROCESSED = 5000;
 
@@ -710,30 +684,27 @@ function markProcessed(eventId) {
   }
 }
 
-// Slack Events endpoint
 app.post("/slack/events", async (req, res) => {
   const body = req.body;
 
-  // 1. URL verification challenge
+  // URL verification challenge
   if (body.type === "url_verification") {
-    console.log("[Slack] URL verification challenge received.");
     return res.json({ challenge: body.challenge });
   }
 
-  // 2. Acknowledge immediately (Slack wants a 200 within 3 s)
+  // Acknowledge immediately
   res.status(200).send();
 
-  // 3. Process event_callback
   if (body.type === "event_callback") {
     const event = body.event;
     const eventId = body.event_id || `${event.ts}-${event.channel}`;
 
-    // Skip duplicates
     if (processedEvents.has(eventId)) return;
     markProcessed(eventId);
 
-    // Only handle messages (not bot messages, not subtypes like joins)
+    // Skip bot messages, subtypes, and token store messages
     if (event.type !== "message" || event.subtype || event.bot_id) return;
+    if ((event.text || "").includes(TOKEN_MARKER)) return;
 
     const text = event.text || "";
     const channel = event.channel;
@@ -744,64 +715,38 @@ app.post("/slack/events", async (req, res) => {
     const classification = classifyMessage(text);
 
     if (classification === "approved") {
-      await postSlackMessage(channel, `✅ Got it — this is now *Approved*. I've updated the Google Doc.`);
-      await updateDocStatus("Approved");
+      await slackPost(channel, `✅ Got it — this is now *Approved*.${SIGNATURE}`);
     } else if (classification === "hold") {
-      await postSlackMessage(channel, `⏸️ Understood — placing this *On Hold*. I've updated the Google Doc.`);
-      await updateDocStatus("On Hold");
+      await slackPost(channel, `⏸️ Understood — placing this *On Hold*.${SIGNATURE}`);
     } else {
-      await postSlackMessage(channel, `📝 Thanks <@${user}>, I've noted your feedback.`);
+      await slackPost(channel, `📝 Thanks <@${user}>, I've noted your feedback.${SIGNATURE}`);
     }
   }
 });
 
-// ─── Google Ads OAuth ─────────────────────────────────────────────────────
+// ─── Google Ads OAuth (kept for other workflows) ────────────────────────────
 
 const GOOGLE_ADS_CLIENT_ID = process.env.GOOGLE_ADS_CLIENT_ID;
 const GOOGLE_ADS_CLIENT_SECRET = process.env.GOOGLE_ADS_CLIENT_SECRET;
-const GOOGLE_ADS_REDIRECT_URI = "https://jarvis-slack-bot-production.up.railway.app/google-ads/callback";
+const GOOGLE_ADS_REDIRECT_URI =
+  "https://jarvis-slack-bot-production.up.railway.app/google-ads/callback";
 const GOOGLE_ADS_SCOPES = "https://www.googleapis.com/auth/adwords";
 const GOOGLE_ADS_DEVELOPER_TOKEN = process.env.GOOGLE_ADS_DEVELOPER_TOKEN;
 const GOOGLE_ADS_CUSTOMER_ID = process.env.GOOGLE_ADS_CUSTOMER_ID;
 const GOOGLE_ADS_MANAGER_ID = process.env.GOOGLE_ADS_MANAGER_ID;
 
-// In-memory Google Ads token store
-let googleAdsTokens = {
-  access_token: null,
-  refresh_token: null,
-  expires_at: null,
-  received_at: null,
-  token_type: null,
-};
+let googleAdsTokens = { access_token: null, refresh_token: null, expires_at: null };
 
-// Step 1: Redirect user to Google OAuth consent screen
 app.get("/google-ads/auth", (req, res) => {
   const state = Math.random().toString(36).substring(2, 15);
-  const authUrl =
-    `https://accounts.google.com/o/oauth2/v2/auth` +
-    `?response_type=code` +
-    `&client_id=${encodeURIComponent(GOOGLE_ADS_CLIENT_ID)}` +
-    `&redirect_uri=${encodeURIComponent(GOOGLE_ADS_REDIRECT_URI)}` +
-    `&scope=${encodeURIComponent(GOOGLE_ADS_SCOPES)}` +
-    `&access_type=offline` +
-    `&prompt=consent` +
-    `&state=${state}`;
-  console.log("[Google Ads] Redirecting to authorization URL.");
+  const authUrl = `https://accounts.google.com/o/oauth2/v2/auth?response_type=code&client_id=${encodeURIComponent(GOOGLE_ADS_CLIENT_ID)}&redirect_uri=${encodeURIComponent(GOOGLE_ADS_REDIRECT_URI)}&scope=${encodeURIComponent(GOOGLE_ADS_SCOPES)}&access_type=offline&prompt=consent&state=${state}`;
   res.redirect(authUrl);
 });
 
-// Step 2: Handle OAuth callback from Google
 app.get("/google-ads/callback", async (req, res) => {
-  const { code, state, error, error_description } = req.query;
-
-  if (error) {
-    console.error(`[Google Ads] OAuth error: ${error} — ${error_description}`);
-    return res.status(400).send(`<h1>Google Ads Authorization Failed</h1><p>${error}: ${error_description}</p>`);
-  }
-
-  if (!code) {
-    return res.status(400).send("<h1>Missing authorization code</h1>");
-  }
+  const { code, error, error_description } = req.query;
+  if (error) return res.status(400).send(`<h1>Google Ads Auth Failed</h1><p>${error}</p>`);
+  if (!code) return res.status(400).send("<h1>Missing authorization code</h1>");
 
   try {
     const tokenResponse = await axios.post(
@@ -813,283 +758,112 @@ app.get("/google-ads/callback", async (req, res) => {
         client_id: GOOGLE_ADS_CLIENT_ID,
         client_secret: GOOGLE_ADS_CLIENT_SECRET,
       }).toString(),
-      {
-        headers: {
-          "Content-Type": "application/x-www-form-urlencoded",
-          Accept: "application/json",
-        },
-      }
+      { headers: { "Content-Type": "application/x-www-form-urlencoded" } }
     );
-
-    const { access_token, refresh_token, expires_in, token_type } = tokenResponse.data;
-
+    const { access_token, refresh_token, expires_in } = tokenResponse.data;
     googleAdsTokens = {
       access_token,
       refresh_token: refresh_token || null,
       expires_at: Date.now() + (expires_in || 3600) * 1000,
-      received_at: new Date().toISOString(),
-      token_type: token_type || "Bearer",
     };
-
-    console.log(`[Google Ads] Authorization successful. Token expires in ${expires_in}s.`);
-
-    res.send(`
-      <html>
-      <body style="font-family: -apple-system, BlinkMacSystemFont, sans-serif; max-width: 600px; margin: 80px auto; text-align: center;">
-        <h1 style="color: #4285F4;">&#x2705; Google Ads Connected!</h1>
-        <p>Authorization successful.</p>
-        <p>Access token received: &#x2705;</p>
-        ${refresh_token ? '<p>Refresh token: &#x2705; Received (auto-renewal enabled)</p>' : '<p>Refresh token: &#x274C; Not provided</p>'}
-        <p>Authorized at: <strong>${new Date().toLocaleString()}</strong></p>
-        <p>Developer Token: <strong>${GOOGLE_ADS_DEVELOPER_TOKEN ? '&#x2705; Configured' : '&#x274C; Not set'}</strong></p>
-        <p>Customer ID: <strong>${GOOGLE_ADS_CUSTOMER_ID || 'Not set'}</strong></p>
-        <p>Manager Account ID: <strong>${GOOGLE_ADS_MANAGER_ID || 'Not set'}</strong></p>
-        <hr>
-        <p style="color: #666;">You can close this window. Jarvis now has a valid Google Ads access token.</p>
-      </body>
-      </html>
-    `);
+    res.send(`<h1>✅ Google Ads Connected!</h1><p>You can close this window.</p>`);
   } catch (err) {
-    console.error("[Google Ads] Token exchange error:", err.response?.data || err.message);
-    res.status(500).send(`<h1>Token Exchange Failed</h1><pre>${JSON.stringify(err.response?.data || err.message, null, 2)}</pre>`);
+    res.status(500).send(`<h1>Token Exchange Failed</h1><pre>${JSON.stringify(err.response?.data || err.message)}</pre>`);
   }
 });
 
-// Retrieve Google Ads tokens (for Jarvis internal use)
 app.get("/google-ads/tokens", (req, res) => {
-  const authHeader = req.headers["x-jarvis-key"];
-  if (authHeader !== "jarvis-internal-2026") {
-    return res.status(403).json({ error: "Unauthorized" });
-  }
-  if (!googleAdsTokens.access_token) {
-    return res.status(404).json({ error: "No Google Ads tokens available. Visit /google-ads/auth first." });
-  }
-  res.json({
-    ...googleAdsTokens,
-    developer_token: GOOGLE_ADS_DEVELOPER_TOKEN,
-    customer_id: GOOGLE_ADS_CUSTOMER_ID,
-    manager_id: GOOGLE_ADS_MANAGER_ID,
-  });
+  if (req.headers["x-jarvis-key"] !== "jarvis-internal-2026") return res.status(403).json({ error: "Unauthorized" });
+  if (!googleAdsTokens.access_token) return res.status(404).json({ error: "No tokens. Visit /google-ads/auth." });
+  res.json({ ...googleAdsTokens, developer_token: GOOGLE_ADS_DEVELOPER_TOKEN, customer_id: GOOGLE_ADS_CUSTOMER_ID, manager_id: GOOGLE_ADS_MANAGER_ID });
 });
 
-// ─── QuickBooks Online OAuth ────────────────────────────────────────────────
+// ─── QuickBooks OAuth (kept for other workflows) ────────────────────────────
 
 const QBO_CLIENT_ID = process.env.QBO_CLIENT_ID || "ABQ8sb9lLaLRhKqKqhZFQf8KK3lJT0vYztIUE9XqH0K193a0Ud";
 const QBO_CLIENT_SECRET = process.env.QBO_CLIENT_SECRET || "CXh0T14JmvzAC5XZfN87asUp4K2DOVg2F48Lz2j5";
 const QBO_REDIRECT_URI = process.env.QBO_REDIRECT_URI || "https://jarvis-slack-bot-production.up.railway.app/quickbooks/callback";
-const QBO_SCOPES = "com.intuit.quickbooks.accounting";
-const QBO_AUTH_ENDPOINT = "https://appcenter.intuit.com/connect/oauth2";
 const QBO_TOKEN_ENDPOINT = "https://oauth.platform.intuit.com/oauth2/v1/tokens/bearer";
 
-// In-memory QBO token store
-let qboTokens = {
-  access_token: null,
-  refresh_token: null,
-  expires_at: null,
-  realm_id: null,
-  received_at: null,
-};
+let qboTokens = { access_token: null, refresh_token: null, expires_at: null, realm_id: null };
 
-// Step 1: Redirect user to Intuit authorization page
 app.get("/quickbooks/auth", (req, res) => {
   const state = Math.random().toString(36).substring(2, 15);
-  const authUrl = `${QBO_AUTH_ENDPOINT}?client_id=${QBO_CLIENT_ID}&response_type=code&scope=${encodeURIComponent(QBO_SCOPES)}&redirect_uri=${encodeURIComponent(QBO_REDIRECT_URI)}&state=${state}`;
-  console.log("[QBO] Redirecting to authorization URL.");
-  res.redirect(authUrl);
+  res.redirect(`https://appcenter.intuit.com/connect/oauth2?client_id=${QBO_CLIENT_ID}&response_type=code&scope=${encodeURIComponent("com.intuit.quickbooks.accounting")}&redirect_uri=${encodeURIComponent(QBO_REDIRECT_URI)}&state=${state}`);
 });
 
-// Step 2: Handle OAuth callback from Intuit
 app.get("/quickbooks/callback", async (req, res) => {
-  const { code, realmId, state, error, error_description } = req.query;
-
-  if (error) {
-    console.error(`[QBO] OAuth error: ${error} — ${error_description}`);
-    return res.status(400).send(`<h1>QuickBooks Authorization Failed</h1><p>${error}: ${error_description}</p>`);
-  }
-
-  if (!code) {
-    return res.status(400).send("<h1>Missing authorization code</h1>");
-  }
-
+  const { code, realmId, error } = req.query;
+  if (error) return res.status(400).send(`<h1>QBO Auth Failed</h1>`);
+  if (!code) return res.status(400).send("<h1>Missing code</h1>");
   try {
     const credentials = Buffer.from(`${QBO_CLIENT_ID}:${QBO_CLIENT_SECRET}`).toString("base64");
-    const tokenResponse = await axios.post(
-      QBO_TOKEN_ENDPOINT,
-      new URLSearchParams({
-        grant_type: "authorization_code",
-        code,
-        redirect_uri: QBO_REDIRECT_URI,
-      }).toString(),
-      {
-        headers: {
-          Authorization: `Basic ${credentials}`,
-          "Content-Type": "application/x-www-form-urlencoded",
-          Accept: "application/json",
-        },
-      }
-    );
-
+    const tokenResponse = await axios.post(QBO_TOKEN_ENDPOINT, new URLSearchParams({ grant_type: "authorization_code", code, redirect_uri: QBO_REDIRECT_URI }).toString(), { headers: { Authorization: `Basic ${credentials}`, "Content-Type": "application/x-www-form-urlencoded" } });
     const { access_token, refresh_token, expires_in } = tokenResponse.data;
-
-    qboTokens = {
-      access_token,
-      refresh_token,
-      expires_at: Date.now() + (expires_in || 3600) * 1000,
-      realm_id: realmId || null,
-      received_at: new Date().toISOString(),
-    };
-
-    console.log(`[QBO] Authorization successful. Realm ID: ${realmId}. Token expires in ${expires_in}s.`);
-
-    res.send(`
-      <html>
-      <body style="font-family: -apple-system, BlinkMacSystemFont, sans-serif; max-width: 600px; margin: 80px auto; text-align: center;">
-        <h1 style="color: #2CA01C;">&#x2705; QuickBooks Online Connected!</h1>
-        <p>Authorization successful for Realm ID: <strong>${realmId}</strong></p>
-        <p>Access token expires: <strong>${new Date(qboTokens.expires_at).toLocaleString()}</strong></p>
-        <p>Refresh token: &#x2705; Received</p>
-        <hr>
-        <p style="color: #666;">You can close this window. Jarvis now has a fresh QBO refresh token.</p>
-      </body>
-      </html>
-    `);
+    qboTokens = { access_token, refresh_token, expires_at: Date.now() + (expires_in || 3600) * 1000, realm_id: realmId };
+    res.send(`<h1>✅ QuickBooks Connected!</h1><p>Realm: ${realmId}</p>`);
   } catch (err) {
-    console.error("[QBO] Token exchange error:", err.response?.data || err.message);
-    res.status(500).send(`<h1>Token Exchange Failed</h1><pre>${JSON.stringify(err.response?.data || err.message, null, 2)}</pre>`);
+    res.status(500).send(`<h1>Token Exchange Failed</h1>`);
   }
 });
 
-// Retrieve QBO tokens (for Jarvis internal use)
 app.get("/quickbooks/tokens", (req, res) => {
-  const authHeader = req.headers["x-jarvis-key"];
-  if (authHeader !== "jarvis-internal-2026") {
-    return res.status(403).json({ error: "Unauthorized" });
-  }
-  if (!qboTokens.access_token) {
-    return res.status(404).json({ error: "No QBO tokens available. Visit /quickbooks/auth first." });
-  }
+  if (req.headers["x-jarvis-key"] !== "jarvis-internal-2026") return res.status(403).json({ error: "Unauthorized" });
+  if (!qboTokens.access_token) return res.status(404).json({ error: "No tokens." });
   res.json(qboTokens);
 });
 
-// ─── Salesforce OAuth ──────────────────────────────────────────────────────
+// ─── Salesforce OAuth (kept for other workflows) ────────────────────────────
 
 const SF_CLIENT_ID = process.env.SF_CLIENT_ID;
 const SF_CLIENT_SECRET = process.env.SF_CLIENT_SECRET;
 const SF_REDIRECT_URI = process.env.SF_REDIRECT_URI || "https://jarvis-slack-bot-production.up.railway.app/salesforce/callback";
-const SF_AUTH_ENDPOINT = "https://login.salesforce.com/services/oauth2/authorize";
-const SF_TOKEN_ENDPOINT = "https://login.salesforce.com/services/oauth2/token";
-const SF_SCOPES = "full refresh_token offline_access";
 
-// In-memory Salesforce token store
-let sfTokens = {
-  access_token: null,
-  refresh_token: null,
-  instance_url: null,
-  expires_at: null,
-  received_at: null,
-};
+let sfTokens = { access_token: null, refresh_token: null, instance_url: null, expires_at: null };
 
-// Step 1: Redirect user to Salesforce authorization page
 app.get("/salesforce/auth", (req, res) => {
   const state = Math.random().toString(36).substring(2, 15);
-  const authUrl = `${SF_AUTH_ENDPOINT}?response_type=code&client_id=${SF_CLIENT_ID}&redirect_uri=${encodeURIComponent(SF_REDIRECT_URI)}&scope=${encodeURIComponent(SF_SCOPES)}&state=${state}`;
-  console.log("[Salesforce] Redirecting to authorization URL.");
-  res.redirect(authUrl);
+  res.redirect(`https://login.salesforce.com/services/oauth2/authorize?response_type=code&client_id=${SF_CLIENT_ID}&redirect_uri=${encodeURIComponent(SF_REDIRECT_URI)}&scope=${encodeURIComponent("full refresh_token offline_access")}&state=${state}`);
 });
 
-// Step 2: Handle OAuth callback from Salesforce
 app.get("/salesforce/callback", async (req, res) => {
-  const { code, state, error, error_description } = req.query;
-
-  if (error) {
-    console.error(`[Salesforce] OAuth error: ${error} — ${error_description}`);
-    return res.status(400).send(`<h1>Salesforce Authorization Failed</h1><p>${error}: ${error_description}</p>`);
-  }
-
-  if (!code) {
-    return res.status(400).send("<h1>Missing authorization code</h1>");
-  }
-
+  const { code, error } = req.query;
+  if (error) return res.status(400).send(`<h1>Salesforce Auth Failed</h1>`);
+  if (!code) return res.status(400).send("<h1>Missing code</h1>");
   try {
-    const tokenResponse = await axios.post(
-      SF_TOKEN_ENDPOINT,
-      new URLSearchParams({
-        grant_type: "authorization_code",
-        code,
-        redirect_uri: SF_REDIRECT_URI,
-        client_id: SF_CLIENT_ID,
-        client_secret: SF_CLIENT_SECRET,
-      }).toString(),
-      {
-        headers: {
-          "Content-Type": "application/x-www-form-urlencoded",
-          Accept: "application/json",
-        },
-      }
-    );
-
-    const { access_token, refresh_token, instance_url, issued_at, token_type } = tokenResponse.data;
-
-    sfTokens = {
-      access_token,
-      refresh_token: refresh_token || null,
-      instance_url: instance_url || null,
-      expires_at: issued_at ? parseInt(issued_at) + 3600 * 1000 : Date.now() + 3600 * 1000,
-      received_at: new Date().toISOString(),
-      token_type: token_type || "Bearer",
-    };
-
-    console.log(`[Salesforce] Authorization successful. Instance URL: ${instance_url}.`);
-
-    res.send(`
-      <html>
-      <body style="font-family: -apple-system, BlinkMacSystemFont, sans-serif; max-width: 600px; margin: 80px auto; text-align: center;">
-        <h1 style="color: #00A1E0;">&#x2705; Salesforce Connected!</h1>
-        <p>Authorization successful.</p>
-        <p>Instance URL: <strong>${instance_url}</strong></p>
-        <p>Access token received: &#x2705;</p>
-        ${refresh_token ? '<p>Refresh token: &#x2705; Received (auto-renewal enabled)</p>' : '<p>Refresh token: &#x274C; Not provided</p>'}
-        <p>Authorized at: <strong>${new Date().toLocaleString()}</strong></p>
-        <hr>
-        <p style="color: #666;">You can close this window. Jarvis now has a valid Salesforce access token.</p>
-      </body>
-      </html>
-    `);
+    const tokenResponse = await axios.post("https://login.salesforce.com/services/oauth2/token", new URLSearchParams({ grant_type: "authorization_code", code, redirect_uri: SF_REDIRECT_URI, client_id: SF_CLIENT_ID, client_secret: SF_CLIENT_SECRET }).toString(), { headers: { "Content-Type": "application/x-www-form-urlencoded" } });
+    const { access_token, refresh_token, instance_url, issued_at } = tokenResponse.data;
+    sfTokens = { access_token, refresh_token, instance_url, expires_at: (issued_at ? parseInt(issued_at) : Date.now()) + 3600000 };
+    res.send(`<h1>✅ Salesforce Connected!</h1><p>Instance: ${instance_url}</p>`);
   } catch (err) {
-    console.error("[Salesforce] Token exchange error:", err.response?.data || err.message);
-    res.status(500).send(`<h1>Token Exchange Failed</h1><pre>${JSON.stringify(err.response?.data || err.message, null, 2)}</pre>`);
+    res.status(500).send(`<h1>Token Exchange Failed</h1>`);
   }
 });
 
-// Retrieve Salesforce tokens (for Jarvis internal use)
 app.get("/salesforce/tokens", (req, res) => {
-  const authHeader = req.headers["x-jarvis-key"];
-  if (authHeader !== "jarvis-internal-2026") {
-    return res.status(403).json({ error: "Unauthorized" });
-  }
-  if (!sfTokens.access_token) {
-    return res.status(404).json({ error: "No Salesforce tokens available. Visit /salesforce/auth first." });
-  }
+  if (req.headers["x-jarvis-key"] !== "jarvis-internal-2026") return res.status(403).json({ error: "Unauthorized" });
+  if (!sfTokens.access_token) return res.status(404).json({ error: "No tokens." });
   res.json(sfTokens);
 });
 
-// ─── Start server ────────────────────────────────────────────────────────────
-app.listen(PORT, () => {
-  console.log(`🤖 Jarvis Slack Bot listening on port ${PORT}`);
-  console.log(`   Health check: http://localhost:${PORT}/health`);
-  console.log(`   Slack events: http://localhost:${PORT}/slack/events`);
-  console.log(`   LinkedIn auth: http://localhost:${PORT}/linkedin/auth`);
-  console.log(`   LinkedIn status: http://localhost:${PORT}/linkedin/status`);
-  console.log(`   Org lookup: http://localhost:${PORT}/linkedin/org-lookup?vanityName=epipheo`);
-  console.log(`   Post to company: POST http://localhost:${PORT}/linkedin/post-company`);
-  console.log(`   Upload image: POST http://localhost:${PORT}/linkedin/upload-image`);
-  console.log(`   Upload video: POST http://localhost:${PORT}/linkedin/upload-video`);
-  console.log(`   Salesforce auth: http://localhost:${PORT}/salesforce/auth`);
-  console.log(`   Salesforce callback: http://localhost:${PORT}/salesforce/callback`);
-  console.log(`   Salesforce tokens: GET http://localhost:${PORT}/salesforce/tokens`);
-  console.log(`   Google Ads auth: http://localhost:${PORT}/google-ads/auth`);
-  console.log(`   Google Ads callback: http://localhost:${PORT}/google-ads/callback`);
-  console.log(`   Google Ads tokens: GET http://localhost:${PORT}/google-ads/tokens`);
+// ─── Start server ───────────────────────────────────────────────────────────
+async function start() {
+  // Load token from Slack before starting the server
+  await loadTokenFromSlack();
+
+  app.listen(PORT, () => {
+    console.log(`🤖 Jarvis v2.0 listening on port ${PORT}`);
+    console.log(`   Token persistence: Slack #jarvis-marketing`);
+    console.log(`   LinkedIn connected: ${!!linkedinTokens.access_token}`);
+    if (linkedinTokens.expires_at) {
+      console.log(`   Token expires: ${new Date(linkedinTokens.expires_at).toISOString()}`);
+    }
+    console.log(`   Health: http://localhost:${PORT}/health`);
+    console.log(`   LinkedIn auth: http://localhost:${PORT}/linkedin/auth`);
+  });
+}
+
+start().catch((err) => {
+  console.error("Failed to start server:", err);
+  process.exit(1);
 });
-// Build trigger Thu Mar 19 16:04:54 EDT 2026
-// deploy trigger 1773956772
