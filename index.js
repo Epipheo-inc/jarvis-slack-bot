@@ -359,6 +359,18 @@ app.get("/linkedin/callback", async (req, res) => {
   }
 });
 
+// Internal token endpoint (protected by x-jarvis-key)
+app.get("/linkedin/token", (req, res) => {
+  const key = req.headers["x-jarvis-key"];
+  if (key !== "jarvis-internal-2026") {
+    return res.status(401).json({ error: "Unauthorized" });
+  }
+  if (!linkedinTokens.access_token) {
+    return res.status(404).json({ error: "No token available. Visit /linkedin/auth first." });
+  }
+  res.json({ access_token: linkedinTokens.access_token });
+});
+
 // Status check
 app.get("/linkedin/status", async (_req, res) => {
   if (!linkedinTokens.access_token) {
