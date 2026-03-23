@@ -709,18 +709,22 @@ app.post("/slack/events", async (req, res) => {
     const text = event.text || "";
     const channel = event.channel;
     const user = event.user;
+    const threadTs = event.thread_ts; // only present on thread replies
 
-    console.log(`[Slack] Message from <${user}> in <${channel}>: ${text}`);
+    console.log(`[Slack] Message from <${user}> in <${channel}>: ${text.substring(0, 80)}`);
 
+    // ONLY respond to thread replies — never to top-level channel messages.
+    // This prevents the bot from reacting to every message in #jarvis-marketing.
+    if (!threadTs) return;
+
+    // Within threads, only acknowledge approval or hold keywords. Stay silent otherwise.
     const classification = classifyMessage(text);
-
     if (classification === "approved") {
-      await slackPost(channel, `✅ Got it — this is now *Approved*.${SIGNATURE}`);
+      await slackPost(channel, `✅ Got it — *Approved*. This week's post will go live Wednesday at 10:00 AM ET.${SIGNATURE}`);
     } else if (classification === "hold") {
-      await slackPost(channel, `⏸️ Understood — placing this *On Hold*.${SIGNATURE}`);
-    } else {
-      await slackPost(channel, `📝 Thanks <@${user}>, I've noted your feedback.${SIGNATURE}`);
+      await slackPost(channel, `⏸️ Understood — *On Hold*. The post will not go out this Wednesday.${SIGNATURE}`);
     }
+    // All other messages: stay completely silent
   }
 });
 
